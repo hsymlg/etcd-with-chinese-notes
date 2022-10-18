@@ -30,12 +30,12 @@ var ErrSessionExpired = errors.New("mutex: session is expired")
 
 // Mutex implements the sync Locker interface with etcd
 type Mutex struct {
-	s *Session
+	s *Session // Session对象
 
-	pfx   string // 锁的共同前缀 pfx，如 "/service/lock/"
-	myKey string // 当前持有锁的客户端的 leaseid 值（完整 Key 的组成为 pfx+"/"+leaseid）
-	myRev int64  // revision，理解为当前持有锁的 Revision（修改数） 编号 或者是 CreateRevision
-	hdr   *pb.ResponseHeader
+	pfx   string             // 锁的前缀，如 "business/lock/"
+	myKey string             // 当前持有锁的客户端的 leaseid 值（完整 Key 的组成为 pfx+"/"+leaseid）
+	myRev int64              // 自增revision
+	hdr   *pb.ResponseHeader // etcd Server中的信息
 }
 
 // 例如：/test/lock + "/"
@@ -43,9 +43,6 @@ func NewMutex(s *Session, pfx string) *Mutex {
 	return &Mutex{s, pfx + "/", "", -1, nil}
 }
 
-// TryLock locks the mutex if not already locked by another session.
-// If lock is held by another session, return immediately after attempting necessary cleanup
-// The ctx argument is used for the sending/receiving Txn RPC.
 func (m *Mutex) TryLock(ctx context.Context) error {
 	resp, err := m.tryAcquire(ctx)
 	if err != nil {
@@ -80,18 +77,16 @@ func (m *Mutex) Lock(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// if no key on prefix / the minimum rev is key, already hold the lock
+	//操作失败，则获取else返回的值，即已有的revision
 	ownerKey := resp.Responses[1].GetResponseRange().Kvs
 	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
+		//获取锁成功
 		m.hdr = resp.Header
 		return nil
 	}
 	client := m.s.Client()
-	// 等待其他程序释放锁,并删除其他revisions
-	// 走到这里代表没有获得锁，需要等待之前的锁被释放，即 CreateRevision 小于当前 CreateRevision 的 kv 被删除
-	// 阻塞等待 Owner 释放锁
-	// wait for deletion revisions prior to myKey
-	// TODO: early termination if the session key is deleted before other session keys with smaller revisions.
+	// 代码走到这里说明没有获得锁，需要等待之前的锁被释放，即revision 小于当前revision 的 kv 被删除
+	// 阻塞等待其他程序释放以为pfx前缀锁,并删除其他revisions
 	_, werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
 	// release lock key if wait failed
 	if werr != nil {
@@ -115,25 +110,20 @@ func (m *Mutex) Lock(ctx context.Context) error {
 }
 
 func (m *Mutex) tryAcquire(ctx context.Context) (*v3.TxnResponse, error) {
+	//申明并赋值session和client
 	s := m.s
 	client := m.s.Client()
-	//下面的 m.pfx 就是 prefix，是传进来的前缀，后面的 s.Lease() 会返回一个租约，是一个 int64 的整数，和 session 有关系
-	//mykex 先理解为是 / prefix/leaseid 这样的结构
+	//赋值myKey为pfx+"/"+leaseid，leaseid是一个64位的整数值，每个客户端唯一
 	m.myKey = fmt.Sprintf("%s%x", m.pfx, s.Lease())
-	//使用事务机制
-	//这里定义一个 cmp 方法，比较上面 m.myKey 的 CreateRevision 是否为 0，等于 0 表示目前不存在该 key，
-	//需要执行 Put 操作，不等于 0 表示对应的 key 已经创建了，需要执行 Get 操作
+	//比较 Key的revision是否为0，为0表示不存在该key
 	cmp := v3.Compare(v3.CreateRevision(m.myKey), "=", 0)
-	//则put key,并设置租约
+	//put key,设置租约
 	put := v3.OpPut(m.myKey, "", v3.WithLease(s.Lease()))
-	//否则 获取这个key,重用租约中的锁(这里主要目的是在于重入)
-	//通过第二次获取锁,判断锁是否存在来支持重入
-	//所以只要租约一致,那么是可以重入的.
+	//再获取锁,判断是否存在相同租约，租约一致，那么是可以重入的.
 	get := v3.OpGet(m.myKey)
 	//通过前缀获取最先创建的key,获取当前锁的真正持有者
 	getOwner := v3.OpGet(m.pfx, v3.WithFirstCreate()...)
-	//获取到自身的revision(注意,此处CreateRevision和Revision不一定相等)
-	// Txn 事务，判断 cmp 的条件是否成立，成立执行 Then，不成立执行 Else，最终执行 Commit()
+	//Txn进行事务处理，判断前面的cmp条件，成立（不存在该key）执行Then中的存入key，不成立（不存在该key）执行Else中的获取
 	resp, err := client.Txn(ctx).If(cmp).Then(put, getOwner).Else(get, getOwner).Commit()
 	if err != nil {
 		return nil, err

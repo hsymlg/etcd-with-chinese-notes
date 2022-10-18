@@ -50,8 +50,6 @@ func waitDelete(ctx context.Context, client *v3.Client, key string, rev int64) e
 
 // 等待持有锁的key删除
 // 内部实现为等其他所有比当前createRevision小的key,监听删除事件
-// waitDeletes efficiently waits until all keys matching the prefix and no greater
-// than the create revision.
 func waitDeletes(ctx context.Context, client *v3.Client, pfx string, maxCreateRev int64) (*pb.ResponseHeader, error) {
 	//WithLastCreate 按照CreateRevision排序,降序 例如 5 4 3 2 1
 	//WithMaxCreateRev 获取比maxCreateRev小的key
