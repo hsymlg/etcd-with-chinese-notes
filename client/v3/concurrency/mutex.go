@@ -50,9 +50,6 @@ func (m *Mutex) TryLock(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// 通过对比自身的revision和最先创建的key的revision得出谁获得了锁
-	// 例如 自身revision:5,最先创建的key createRevision:3  那么不获得锁,进入waitDeletes
-	// 自身revision:5,最先创建的key createRevision:5  那么获得锁
 	// if no key on prefix / the minimum rev is key, already hold the lock
 	ownerKey := resp.Responses[1].GetResponseRange().Kvs
 	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
@@ -83,7 +80,6 @@ func (m *Mutex) Lock(ctx context.Context) error {
 		return nil
 	}
 	client := m.s.Client()
-	// 等待其他程序释放锁,并删除其他revisions
 	// wait for deletion revisions prior to myKey
 	// TODO: early termination if the session key is deleted before other session keys with smaller revisions.
 	_, werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
