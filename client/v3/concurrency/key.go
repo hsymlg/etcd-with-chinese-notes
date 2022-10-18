@@ -29,6 +29,7 @@ func waitDelete(ctx context.Context, client *v3.Client, key string, rev int64) e
 	defer cancel()
 
 	var wr v3.WatchResponse
+	// wch 是个 channel，key 被删除后会往这个 chan 发数据
 	wch := client.Watch(cctx, key, v3.WithRev(rev))
 	for wr = range wch {
 		for _, ev := range wr.Events {

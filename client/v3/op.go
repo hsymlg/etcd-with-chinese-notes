@@ -388,6 +388,7 @@ func getPrefix(key []byte) []byte {
 // on the keys with matching prefix. For example, 'Get(foo, WithPrefix())'
 // can return 'foo1', 'foo2', and so on.
 func WithPrefix() OpOption {
+	// 返回所有满足 prefix 匹配的 key-value，和 etcdctl get key --prefix 功能一样
 	return func(op *Op) {
 		op.isOptsWithPrefix = true
 		if len(op.key) == 0 {

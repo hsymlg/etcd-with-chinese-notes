@@ -54,8 +54,11 @@ func (m *Mutex) TryLock(ctx context.Context) error {
 	// 通过对比自身的revision和最先创建的key的revision得出谁获得了锁
 	// 例如 自身revision:5,最先创建的key createRevision:3  那么不获得锁,进入waitDeletes
 	// 自身revision:5,最先创建的key createRevision:5  那么获得锁
+	// 获取当前实际拿到锁的KEY
 	// if no key on prefix / the minimum rev is key, already hold the lock
 	ownerKey := resp.Responses[1].GetResponseRange().Kvs
+	// 比较如果当前没有人获得锁（第一次场景）
+	// 或者锁的 owner 的 CreateRevision 等于当前的 key 的 CreateRevision，则表示m.myKey即为拿到锁的key，不用新建，直接使用即可
 	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
 		m.hdr = resp.Header
 		return nil
@@ -85,6 +88,8 @@ func (m *Mutex) Lock(ctx context.Context) error {
 	}
 	client := m.s.Client()
 	// 等待其他程序释放锁,并删除其他revisions
+	// 走到这里代表没有获得锁，需要等待之前的锁被释放，即 CreateRevision 小于当前 CreateRevision 的 kv 被删除
+	// 阻塞等待 Owner 释放锁
 	// wait for deletion revisions prior to myKey
 	// TODO: early termination if the session key is deleted before other session keys with smaller revisions.
 	_, werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
@@ -112,10 +117,12 @@ func (m *Mutex) Lock(ctx context.Context) error {
 func (m *Mutex) tryAcquire(ctx context.Context) (*v3.TxnResponse, error) {
 	s := m.s
 	client := m.s.Client()
-	//生成锁的key
+	//下面的 m.pfx 就是 prefix，是传进来的前缀，后面的 s.Lease() 会返回一个租约，是一个 int64 的整数，和 session 有关系
+	//mykex 先理解为是 / prefix/leaseid 这样的结构
 	m.myKey = fmt.Sprintf("%s%x", m.pfx, s.Lease())
 	//使用事务机制
-	//比较key的revision为0(0标示没有key)
+	//这里定义一个 cmp 方法，比较上面 m.myKey 的 CreateRevision 是否为 0，等于 0 表示目前不存在该 key，
+	//需要执行 Put 操作，不等于 0 表示对应的 key 已经创建了，需要执行 Get 操作
 	cmp := v3.Compare(v3.CreateRevision(m.myKey), "=", 0)
 	//则put key,并设置租约
 	put := v3.OpPut(m.myKey, "", v3.WithLease(s.Lease()))
@@ -123,9 +130,10 @@ func (m *Mutex) tryAcquire(ctx context.Context) (*v3.TxnResponse, error) {
 	//通过第二次获取锁,判断锁是否存在来支持重入
 	//所以只要租约一致,那么是可以重入的.
 	get := v3.OpGet(m.myKey)
-	//通过前缀获取最先创建的key
+	//通过前缀获取最先创建的key,获取当前锁的真正持有者
 	getOwner := v3.OpGet(m.pfx, v3.WithFirstCreate()...)
 	//获取到自身的revision(注意,此处CreateRevision和Revision不一定相等)
+	// Txn 事务，判断 cmp 的条件是否成立，成立执行 Then，不成立执行 Else，最终执行 Commit()
 	resp, err := client.Txn(ctx).If(cmp).Then(put, getOwner).Else(get, getOwner).Commit()
 	if err != nil {
 		return nil, err
