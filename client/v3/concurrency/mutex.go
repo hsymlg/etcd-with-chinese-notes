@@ -38,6 +38,7 @@ type Mutex struct {
 	hdr   *pb.ResponseHeader
 }
 
+// 例如：/test/lock + "/"
 func NewMutex(s *Session, pfx string) *Mutex {
 	return &Mutex{s, pfx + "/", "", -1, nil}
 }
@@ -50,6 +51,9 @@ func (m *Mutex) TryLock(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// 通过对比自身的revision和最先创建的key的revision得出谁获得了锁
+	// 例如 自身revision:5,最先创建的key createRevision:3  那么不获得锁,进入waitDeletes
+	// 自身revision:5,最先创建的key createRevision:5  那么获得锁
 	// if no key on prefix / the minimum rev is key, already hold the lock
 	ownerKey := resp.Responses[1].GetResponseRange().Kvs
 	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
@@ -80,6 +84,7 @@ func (m *Mutex) Lock(ctx context.Context) error {
 		return nil
 	}
 	client := m.s.Client()
+	// 等待其他程序释放锁,并删除其他revisions
 	// wait for deletion revisions prior to myKey
 	// TODO: early termination if the session key is deleted before other session keys with smaller revisions.
 	_, werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
@@ -107,15 +112,20 @@ func (m *Mutex) Lock(ctx context.Context) error {
 func (m *Mutex) tryAcquire(ctx context.Context) (*v3.TxnResponse, error) {
 	s := m.s
 	client := m.s.Client()
-
+	//生成锁的key
 	m.myKey = fmt.Sprintf("%s%x", m.pfx, s.Lease())
+	//使用事务机制
+	//比较key的revision为0(0标示没有key)
 	cmp := v3.Compare(v3.CreateRevision(m.myKey), "=", 0)
-	// put self in lock waiters via myKey; oldest waiter holds lock
+	//则put key,并设置租约
 	put := v3.OpPut(m.myKey, "", v3.WithLease(s.Lease()))
-	// reuse key in case this session already holds the lock
+	//否则 获取这个key,重用租约中的锁(这里主要目的是在于重入)
+	//通过第二次获取锁,判断锁是否存在来支持重入
+	//所以只要租约一致,那么是可以重入的.
 	get := v3.OpGet(m.myKey)
-	// fetch current holder to complete uncontended path with only one RPC
+	//通过前缀获取最先创建的key
 	getOwner := v3.OpGet(m.pfx, v3.WithFirstCreate()...)
+	//获取到自身的revision(注意,此处CreateRevision和Revision不一定相等)
 	resp, err := client.Txn(ctx).If(cmp).Then(put, getOwner).Else(get, getOwner).Commit()
 	if err != nil {
 		return nil, err
